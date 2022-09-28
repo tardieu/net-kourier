@@ -19,11 +19,19 @@ package envoy
 import (
 	"time"
 
+	xds_core_v3 "github.com/cncf/xds/go/xds/core/v3"
+	xds_matcher_v3 "github.com/cncf/xds/go/xds/type/matcher/v3"
 	accesslog_v3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	envoy_api_v3_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	accesslog_file_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
+	matchingv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/common/matching/v3"
+	compositev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/composite/v3"
+	stateful_sessionv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
+	httpv3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
+	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -41,6 +49,63 @@ func NewHTTPConnectionManager(routeConfigName string, kourierConfig *config.Kour
 	if config.ExternalAuthz.Enabled {
 		filters = append(filters, config.ExternalAuthz.HTTPFilter)
 	}
+
+	// Append a composite filter that enables Envoy's stateful_session extension when
+	// the request includes the header "Envoy-Session: cookie"
+	// The session state is encapsulated in the cookie named "envoy-session"
+	cookieConf, err := anypb.New(&cookiev3.CookieBasedSessionState{Cookie: &httpv3.Cookie{Name: "envoy-session"}})
+	if err != nil {
+		panic(err)
+	}
+	sessionConf, err := anypb.New(&stateful_sessionv3.StatefulSession{
+		SessionState: &envoy_api_v3_core.TypedExtensionConfig{
+			Name:        "envoy.http.stateful_session.cookie",
+			TypedConfig: cookieConf,
+		}})
+	if err != nil {
+		panic(err)
+	}
+	actionConf, err := anypb.New(&compositev3.ExecuteFilterAction{
+		TypedConfig: &envoy_api_v3_core.TypedExtensionConfig{
+			Name:        "envoy.filters.http.stateful_session",
+			TypedConfig: sessionConf,
+		}})
+	if err != nil {
+		panic(err)
+	}
+	matcherConf, err := anypb.New(&matcherv3.HttpRequestHeaderMatchInput{HeaderName: "envoy-session"})
+	if err != nil {
+		panic(err)
+	}
+	compositeConf, err := anypb.New(&matchingv3.ExtensionWithMatcher{
+		XdsMatcher: &xds_matcher_v3.Matcher{
+			MatcherType: &xds_matcher_v3.Matcher_MatcherTree_{
+				MatcherTree: &xds_matcher_v3.Matcher_MatcherTree{
+					Input: &xds_core_v3.TypedExtensionConfig{
+						Name:        "matcher",
+						TypedConfig: matcherConf,
+					},
+					TreeType: &xds_matcher_v3.Matcher_MatcherTree_ExactMatchMap{
+						ExactMatchMap: &xds_matcher_v3.Matcher_MatcherTree_MatchMap{
+							Map: map[string]*xds_matcher_v3.Matcher_OnMatch{
+								"cookie": {
+									OnMatch: &xds_matcher_v3.Matcher_OnMatch_Action{
+										Action: &xds_core_v3.TypedExtensionConfig{
+											Name:        "action",
+											TypedConfig: actionConf,
+										}}}}}}}}},
+		ExtensionConfig: &envoy_api_v3_core.TypedExtensionConfig{
+			Name: "envoy.filters.http.composite",
+			TypedConfig: &anypb.Any{
+				TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.composite.v3.Composite",
+			}}})
+	if err != nil {
+		panic(err)
+	}
+	filters = append(filters, &hcm.HttpFilter{
+		Name:       "composite",
+		ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: compositeConf},
+	})
 
 	// Append the Router filter at the end.
 	filters = append(filters, &hcm.HttpFilter{
